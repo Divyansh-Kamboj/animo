@@ -40,16 +40,16 @@ _ai = AzureOpenAI(
 # ---------------------------------------------------------------------------
 
 def _fetch_track(track_id: str) -> dict | None:
-    """Return {title, artist} for the track, or None if not found."""
+    """Return {title, artist, view_count, subscriber_count} for the track."""
     try:
         response = (
             _db.table("tracks")
-            .select("title, artist")
+            .select("title, artist, view_count, subscriber_count")
             .eq("id", track_id)
             .single()
             .execute()
         )
-        return response.data  # single() unwraps to a dict, not a list
+        return response.data
     except Exception:
         logger.error("Could not fetch track %s", track_id, exc_info=True)
         return None
@@ -76,18 +76,37 @@ def _fetch_recent_comments(track_id: str, limit: int = 10) -> list[str]:
         return []
 
 
-def _call_model(artist: str, title: str, comments: list[str]) -> str | None:
+def _call_model(
+    artist: str,
+    title: str,
+    comments: list[str],
+    view_count: int | None = None,
+    subscriber_count: int | None = None,
+) -> str | None:
     """Build the prompt and call GPT-4o. Returns the raw text response."""
     deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o")
 
     comment_block = (
         "\n".join(f"- {c}" for c in comments) if comments else "(no comments yet)"
     )
-    user_prompt = (
-        f"Artist: {artist}\n"
-        f"Song: {title}\n"
-        f"Recent community comments:\n{comment_block}"
+
+    # Discovery context — helps the model convey how undiscovered the artist is
+    discovery_lines = []
+    if view_count is not None:
+        discovery_lines.append(f"YouTube views: {view_count:,}")
+    if subscriber_count is not None:
+        discovery_lines.append(f"Artist subscribers: {subscriber_count:,}")
+    discovery_block = (
+        "Discovery context:\n" + "\n".join(discovery_lines)
+        if discovery_lines else ""
     )
+
+    user_prompt = "\n".join(filter(None, [
+        f"Artist: {artist}",
+        f"Song: {title}",
+        discovery_block,
+        f"Recent community comments:\n{comment_block}",
+    ]))
 
     try:
         completion = _ai.chat.completions.create(
@@ -154,7 +173,13 @@ def generate_new_vibe(track_id: str) -> str | None:
         "Generating vibe for '%s – %s' with %d comment(s)", artist, title, len(comments)
     )
 
-    vibe = _call_model(artist, title, comments)
+    vibe = _call_model(
+        artist,
+        title,
+        comments,
+        view_count=track.get("view_count"),
+        subscriber_count=track.get("subscriber_count"),
+    )
     if not vibe:
         return None
 

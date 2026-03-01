@@ -84,6 +84,7 @@ def _sync_user_genres_from_vouch(user_id: str, track_id: str) -> None:
 
 class SurveyRequest(BaseModel):
     seed_artists: list[str]
+    niche_value:  float = 0.5   # 0.0 = ultra-underground, 1.0 = mainstream allowed
 
 
 class CommentRequest(BaseModel):
@@ -122,7 +123,7 @@ def open_pack(
             seeds = seeds + user_genres  # genres resolve as YT Music topics/artists
 
     # 2. Discover niche tracks
-    raw_tracks = discovery.get_niche_tracks(seeds)
+    raw_tracks = discovery.get_niche_tracks(seeds, niche_value=survey.niche_value)
     if not raw_tracks:
         raise HTTPException(
             status_code=502,

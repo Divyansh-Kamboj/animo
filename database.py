@@ -7,7 +7,8 @@ Expected schema
 ---------------
 tracks            : id (uuid PK), title, artist, youtube_id, spotify_img,
                     genre_tags (text[]), vouch_count (int, default 0),
-                    vibe_description (text, nullable)
+                    vibe_description (text, nullable),
+                    view_count (bigint, nullable), subscriber_count (bigint, nullable)
 comments          : id (uuid PK), track_id (uuid FK → tracks.id), text, created_at
 user_profiles     : id (uuid PK FK → auth.users), favorite_genres (text[]),
                     total_vouches (int), onboarding_complete (bool)
@@ -59,11 +60,13 @@ def save_track_to_db(track_data: dict) -> str | None:
     The ``id`` (UUID string) of the inserted row, or ``None`` on failure.
     """
     payload = {
-        "title":       track_data.get("title"),
-        "artist":      track_data.get("artist"),
-        "youtube_id":  track_data.get("youtube_id"),
-        "spotify_img": track_data.get("spotify_img"),
-        "genre_tags":  track_data.get("genre_tags", []),
+        "title":            track_data.get("title"),
+        "artist":           track_data.get("artist"),
+        "youtube_id":       track_data.get("youtube_id"),
+        "spotify_img":      track_data.get("spotify_img"),
+        "genre_tags":       track_data.get("genre_tags", []),
+        "view_count":       track_data.get("view_count"),
+        "subscriber_count": track_data.get("subscriber_count"),
     }
 
     try:
