@@ -144,6 +144,58 @@ def add_comment(track_id: str, text: str) -> int | None:
         return None
 
 
+def get_track_genres(track_id: str) -> list[str]:
+    """Return the genre_tags list for a track, or empty list on failure."""
+    try:
+        response = (
+            _db.table("tracks")
+            .select("genre_tags")
+            .eq("id", track_id)
+            .single()
+            .execute()
+        )
+        return response.data.get("genre_tags") or []
+    except Exception:
+        logger.warning("Could not fetch genres for track %s", track_id, exc_info=True)
+        return []
+
+
+def get_user_favorite_genres(user_id: str) -> list[str]:
+    """Return favorite_genres from user_profiles, or empty list if no profile yet."""
+    try:
+        response = (
+            _db.table("user_profiles")
+            .select("favorite_genres")
+            .eq("id", user_id)
+            .single()
+            .execute()
+        )
+        return response.data.get("favorite_genres") or []
+    except Exception:
+        logger.warning("Could not fetch profile for user %s", user_id, exc_info=True)
+        return []
+
+
+def upsert_user_genres(user_id: str, new_genres: list[str]) -> None:
+    """
+    Merge ``new_genres`` into ``user_profiles.favorite_genres`` for the user.
+
+    Uses an ordered dedup so earlier (longer-standing) preferences stay first.
+    Upserts the profile row so the first vouch creates the profile automatically.
+    """
+    current = get_user_favorite_genres(user_id)
+    # dict.fromkeys preserves order while deduplicating
+    merged = list(dict.fromkeys(current + new_genres))
+    try:
+        _db.table("user_profiles").upsert(
+            {"id": user_id, "favorite_genres": merged},
+            on_conflict="id",
+        ).execute()
+        logger.info("Upserted genres for user %s: %s", user_id, merged)
+    except Exception:
+        logger.error("Could not upsert genres for user %s", user_id, exc_info=True)
+
+
 def get_user_taste(user_id: str) -> list[str]:
     """
     Return the top 3 genre tags across all tracks this user has interacted with.

@@ -6,3 +6,4 @@ supabase
 openai
 python-dotenv
 azure-functions
+PyJWT
