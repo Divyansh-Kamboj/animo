@@ -5,9 +5,15 @@ Handles all reads and writes to the Supabase backend.
 
 Expected schema
 ---------------
-tracks   : id (uuid PK), title, artist, youtube_id, spotify_img,
-           genre_tags (text[]), vouch_count (int, default 0)
-comments : id (uuid PK), track_id (uuid FK → tracks.id), text, created_at
+tracks            : id (uuid PK), title, artist, youtube_id, spotify_img,
+                    genre_tags (text[]), vouch_count (int, default 0),
+                    vibe_description (text, nullable)
+comments          : id (uuid PK), track_id (uuid FK → tracks.id), text, created_at
+user_profiles     : id (uuid PK FK → auth.users), favorite_genres (text[]),
+                    total_vouches (int), onboarding_complete (bool)
+user_interactions : id (uuid PK), user_id (uuid FK → auth.users),
+                    track_id (uuid FK → tracks.id),
+                    interaction_type ('vouch'|'comment'), created_at
 
 The increment_vouch() function requires a Postgres helper:
 
@@ -19,6 +25,7 @@ The increment_vouch() function requires a Postgres helper:
 
 import logging
 import os
+from collections import Counter
 
 from dotenv import load_dotenv
 from supabase import Client, create_client
@@ -135,3 +142,60 @@ def add_comment(track_id: str, text: str) -> int | None:
         )
         # Comment was saved; return None to signal the count is unknown
         return None
+
+
+def get_user_taste(user_id: str) -> list[str]:
+    """
+    Return the top 3 genre tags across all tracks this user has interacted with.
+
+    Aggregates genre_tags from every track the user has vouched for or
+    commented on, counts occurrences, and returns the three most frequent.
+
+    Parameters
+    ----------
+    user_id:
+        UUID of the auth user.
+
+    Returns
+    -------
+    List of up to 3 genre tag strings, ordered by interaction frequency.
+    Returns an empty list when the user has no interactions or on failure.
+    """
+    # 1. Collect the track IDs this user has touched
+    try:
+        interactions = (
+            _db.table("user_interactions")
+            .select("track_id")
+            .eq("user_id", user_id)
+            .execute()
+        )
+        track_ids = list({row["track_id"] for row in (interactions.data or [])})
+    except Exception:
+        logger.error("Could not fetch interactions for user %s", user_id, exc_info=True)
+        return []
+
+    if not track_ids:
+        logger.info("No interactions found for user %s", user_id)
+        return []
+
+    # 2. Fetch genre_tags for those tracks in one query
+    try:
+        tracks = (
+            _db.table("tracks")
+            .select("genre_tags")
+            .in_("id", track_ids)
+            .execute()
+        )
+    except Exception:
+        logger.error("Could not fetch track genres for user %s", user_id, exc_info=True)
+        return []
+
+    # 3. Flatten all genre lists and tally frequency
+    genre_counts: Counter = Counter()
+    for row in (tracks.data or []):
+        for genre in (row.get("genre_tags") or []):
+            genre_counts[genre] += 1
+
+    top_3 = [genre for genre, _ in genre_counts.most_common(3)]
+    logger.info("Top genres for user %s: %s", user_id, top_3)
+    return top_3
