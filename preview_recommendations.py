@@ -92,8 +92,19 @@ def _print_track(index: int, track: dict) -> None:
     preview    = track.get("preview_url") or "—"
     yt_url     = f"https://music.youtube.com/watch?v={track['youtube_id']}"
 
+    view_count       = track.get("view_count")
+    niche_score      = track.get("niche_score")
+    subscriber_count = track.get("subscriber_count")
+
+    view_str  = f"{view_count:,}" if view_count is not None else "—"
+    score_str = f"{niche_score}/100" if niche_score is not None else "—"
+    sub_str   = f"{subscriber_count:,}" if subscriber_count is not None else "—"
+
     print(f"\n  {index}.  {track['title']}")
     print(f"       Artist      : {track['artist']}")
+    print(f"       YT Views    : {view_str}")
+    print(f"       Niche Score : {score_str}  (frontier proximity)")
+    print(f"       Subscribers : {sub_str}")
     print(f"       Genres      : {genres}")
     print(f"       Popularity  : {popularity}")
     print(f"       Preview     : {preview}")
@@ -104,16 +115,18 @@ def _print_track(index: int, track: dict) -> None:
 # Core test function
 # ---------------------------------------------------------------------------
 
-def test_query(song_title: str, artist_name: str) -> None:
+def test_query(song_title: str, artist_name: str, niche_value: float = 0.5) -> None:
     """
     Mimic the /open-pack flow for a single (song, artist) pair.
 
     The artist is used as the niche-engine seed; the song title provides
     user-facing context only (the engine works at the artist graph level).
     """
+    max_views = int(10 ** (3 + niche_value * 5))
     print(f"\n{_BAR}")
     print(f"  Seed artist : {artist_name}")
     print(f"  Inspired by : {song_title}")
+    print(f"  Niche value : {niche_value}  →  ceiling = {max_views:,} views")
     print(_BAR)
 
     # ------------------------------------------------------------------
@@ -122,7 +135,7 @@ def test_query(song_title: str, artist_name: str) -> None:
     print("  [1/2] Scanning artist graph ...", end="", flush=True)
 
     try:
-        raw_tracks = get_niche_tracks([artist_name])
+        raw_tracks = get_niche_tracks([artist_name], niche_value=niche_value)
     except Exception as e:
         print(f"\n  [ERROR] Discovery failed: {e}")
         return
@@ -179,6 +192,15 @@ def test_query(song_title: str, artist_name: str) -> None:
     print(f"\n{_BAR}\n")
 
 
+def _parse_niche_value(raw: str) -> float:
+    """Parse and clamp a niche_value string to [0.0, 1.0]."""
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except ValueError:
+        print(f"  Invalid niche value '{raw}' — using default 0.5")
+        return 0.5
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -189,14 +211,15 @@ if __name__ == "__main__":
 
     try:
         while True:
-            song_title  = input("  Song title  : ").strip()
-            artist_name = input("  Artist name : ").strip()
+            song_title   = input("  Song title       : ").strip()
+            artist_name  = input("  Artist name      : ").strip()
+            niche_raw    = input("  Niche value [0–1]: ").strip() or "0.5"
 
             if not artist_name:
                 print("  Artist name is required — please try again.\n")
                 continue
 
-            test_query(song_title or "—", artist_name)
+            test_query(song_title or "—", artist_name, _parse_niche_value(niche_raw))
 
             again = input("  Try another? [Y/n] : ").strip().lower()
             if again in ("n", "no"):
