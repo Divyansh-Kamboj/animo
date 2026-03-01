@@ -1,9 +1,9 @@
 """
-discovery.py — Animo Niche Engine
+discovery.py — Animo Niche Engine (Recursive)
 
-Expands a list of seed artists two degrees through YouTube Music's related-artist
-graph, filters out chart artists, then applies a user-controlled view-count ceiling
-(the "Niche Slider") to select and score the final tracks.
+Traverses YouTube Music's related-artist graph recursively, collecting tracks
+that fall inside a user-controlled view-count window [MIN_VIEWS, max_views].
+Depth is capped at MAX_DEPTH to prevent infinite loops.
 """
 
 import logging
@@ -15,55 +15,58 @@ logger = logging.getLogger(__name__)
 
 _ytmusic = YTMusic()
 
-MAX_TRACKS    = 5
-SONGS_TO_CHECK = 5   # max songs inspected per candidate artist for view count
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+MIN_VIEWS          = 40_000   # absolute floor — below this is too obscure
+MAX_TRACKS         = 5
+MAX_DEPTH          = 3        # max recursion levels
+SONGS_TO_CHECK     = 5        # songs inspected per candidate artist
+MAX_PER_ARTIST     = 2        # diversification cap — max tracks from one artist
 
 
 # ---------------------------------------------------------------------------
-# Ceiling + scoring helpers
+# Math helpers
 # ---------------------------------------------------------------------------
 
 def _compute_max_views(niche_value: float) -> int:
     """
-    Map a 0.0–1.0 niche slider value to a logarithmic view-count ceiling.
+    Map 0.0–1.0 to a logarithmic view-count ceiling.
 
-    niche_value | max_views
-    ------------|----------
-    0.0         |      1 000   (ultra-underground)
-    0.5         |    316 227   (deep niche)
-    1.0         | 100 000 000  (mainstream allowed)
+    niche_value | max_views (approx)
+    ------------|-------------------
+    0.0         |        40 000   (ultra-tight window at the floor)
+    0.5         |     1 260 000
+    1.0         |   100 000 000
+
+    Formula: 10 ** (4.6 + niche_value * 3.4)
     """
     niche_value = max(0.0, min(1.0, niche_value))
-    return int(10 ** (3 + niche_value * 5))
+    return int(10 ** (4.6 + niche_value * 3.4))
 
 
 def _compute_niche_score(view_count: int, max_views: int) -> int:
     """
-    Score 0–100 representing how close the track sits to the user's Niche Frontier.
-
-    A track right at the ceiling scores 100 (perfectly at the frontier).
-    A track with almost no views scores near 0 (deep underground).
+    0–100 score: how close the track sits to the max_views frontier.
+    100 = right at the ceiling, 0 = right at the floor.
     """
-    if max_views == 0:
+    if max_views <= MIN_VIEWS:
         return 0
-    return min(100, round((view_count / max_views) * 100))
+    span = max_views - MIN_VIEWS
+    return min(100, round(((view_count - MIN_VIEWS) / span) * 100))
 
 
 def _parse_subscriber_count(subscriber_str: str | None) -> int:
-    """
-    Convert a subscriber string like '1.23M subscribers' or '500K' to an integer.
-    Returns 0 if the string cannot be parsed.
-    """
+    """'1.23M subscribers' → 1_230_000. Returns 0 on failure."""
     if not subscriber_str:
         return 0
-    # Isolate the first token (e.g. "1.23M" from "1.23M subscribers")
     token = subscriber_str.strip().split()[0].lower()
     match = re.match(r"^([\d.]+)([kmb]?)$", token)
     if not match:
         return 0
-    number   = float(match.group(1))
-    suffix   = match.group(2)
-    mult     = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}.get(suffix, 1)
+    number = float(match.group(1))
+    mult   = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}.get(match.group(2), 1)
     return int(number * mult)
 
 
@@ -72,37 +75,62 @@ def _parse_subscriber_count(subscriber_str: str | None) -> int:
 # ---------------------------------------------------------------------------
 
 def _resolve_browse_id(artist_name: str) -> str | None:
-    """Search for an artist by name and return the first result's browseId."""
+    """Search for an artist and return the first result's browseId."""
     try:
         results = _ytmusic.search(artist_name, filter="artists")
-        if not results:
-            logger.warning("No search results for artist '%s'", artist_name)
-            return None
-        return results[0].get("browseId")
+        if results:
+            return results[0].get("browseId")
+        logger.warning("No search results for '%s'", artist_name)
     except Exception:
-        logger.warning("Search failed for artist '%s'", artist_name, exc_info=True)
-        return None
+        logger.warning("Artist search failed for '%s'", artist_name, exc_info=True)
+    return None
 
 
-def _get_related_artists(browse_id: str) -> list[dict]:
+def _get_artist_related_list(browse_id: str) -> list[dict]:
     """
-    Return the related-artist list from an artist page.
-    Each item contains at minimum: browseId, title, subscribers.
+    Return the related-artist list for a given browseId.
+
+    Tries ``get_artist_related(related_browse_id)`` first (full list via the
+    dedicated endpoint), falls back to the inline results from ``get_artist``.
+    Each item has: browseId, title, subscribers.
     """
     try:
-        artist_data = _ytmusic.get_artist(browse_id)
-        return artist_data.get("related", {}).get("results", [])
+        artist_data      = _ytmusic.get_artist(browse_id)
+        related_section  = artist_data.get("related", {})
+        related_browse_id = related_section.get("browseId")
+
+        if related_browse_id:
+            try:
+                return _ytmusic.get_artist_related(related_browse_id)
+            except Exception:
+                logger.debug(
+                    "get_artist_related() failed for %s — using inline results",
+                    related_browse_id,
+                )
+
+        return related_section.get("results", [])
+
     except Exception:
-        logger.warning(
-            "Could not fetch related artists for browseId '%s'", browse_id, exc_info=True
-        )
+        logger.warning("Could not fetch related for browseId '%s'", browse_id, exc_info=True)
         return []
+
+
+def _get_view_count(video_id: str) -> int | None:
+    """Return the integer viewCount from videoDetails, or None."""
+    try:
+        data     = _ytmusic.get_song(video_id)
+        view_str = data.get("videoDetails", {}).get("viewCount", "")
+        if view_str and view_str.isdigit():
+            return int(view_str)
+    except Exception:
+        logger.debug("Could not fetch view count for '%s'", video_id, exc_info=True)
+    return None
 
 
 def _get_chart_artist_names() -> set[str]:
     """Return a lower-cased set of global chart artist names."""
     try:
-        charts = _ytmusic.get_charts(country="ZZ")
+        charts  = _ytmusic.get_charts(country="ZZ")
         section = charts.get("artists", [])
         items   = section.get("items", []) if isinstance(section, dict) else section
         return {item.get("title", "").lower() for item in items if item.get("title")}
@@ -111,31 +139,17 @@ def _get_chart_artist_names() -> set[str]:
         return set()
 
 
-def _get_view_count(video_id: str) -> int | None:
-    """
-    Fetch the viewCount for a YouTube Music video.
-    Returns an integer or None if unavailable.
-    """
-    try:
-        song_data = _ytmusic.get_song(video_id)
-        view_str  = song_data.get("videoDetails", {}).get("viewCount", "")
-        if view_str and view_str.isdigit():
-            return int(view_str)
-    except Exception:
-        logger.debug("Could not fetch view count for videoId '%s'", video_id, exc_info=True)
-    return None
-
-
-def _find_track_within_ceiling(
+def _find_track_in_window(
     artist_name: str,
+    min_views: int,
     max_views: int,
+    depth: int,
 ) -> dict | None:
     """
-    Search for songs by ``artist_name`` and return the track closest to (but
-    under) the ``max_views`` ceiling — the one sitting at the Niche Frontier.
+    Search for songs by ``artist_name`` and return the track closest to the
+    max_views frontier that falls within [min_views, max_views].
 
-    Checks up to SONGS_TO_CHECK songs, picks the highest-scoring valid one.
-    Returns None if no song passes the ceiling filter.
+    Checks up to SONGS_TO_CHECK results; picks the highest niche_score.
     """
     try:
         results = _ytmusic.search(artist_name, filter="songs")
@@ -155,24 +169,118 @@ def _find_track_within_ceiling(
         if view_count is None:
             continue
 
-        if view_count >= max_views:
+        if not (min_views <= view_count <= max_views):
             logger.debug(
-                "'%s' by %s has %d views — exceeds ceiling of %d, skipping",
-                title, artist_name, view_count, max_views,
+                "'%s' (%s) — %d views outside window [%d, %d]",
+                title, artist_name, view_count, min_views, max_views,
             )
             continue
 
         score = _compute_niche_score(view_count, max_views)
         if best is None or score > best["niche_score"]:
             best = {
-                "artist":     artist_name,
-                "title":      title,
-                "youtube_id": video_id,
-                "view_count": view_count,
+                "artist":      artist_name,
+                "title":       title,
+                "youtube_id":  video_id,
+                "view_count":  view_count,
                 "niche_score": score,
+                "depth_level": depth,
             }
 
     return best
+
+
+# ---------------------------------------------------------------------------
+# Recursive core
+# ---------------------------------------------------------------------------
+
+def _find_tracks_within_window(
+    browse_id:     str,
+    min_views:     int,
+    max_views:     int,
+    chart_names:   set[str],
+    depth:         int,
+    seen:          set[str],
+    pack:          list[dict],
+    artist_counts: dict[str, int],
+) -> None:
+    """
+    Recursive worker. Mutates ``pack``, ``seen``, and ``artist_counts`` in place.
+
+    For each related artist of ``browse_id``:
+      - Skip if on global charts or already visited.
+      - Search their songs for a track within [min_views, max_views].
+      - If found, add to pack (up to MAX_PER_ARTIST per artist).
+
+    After exhausting the related list, recurse into the single most niche
+    (lowest subscriber count) related artist that was not already added,
+    up to MAX_DEPTH levels.
+    """
+    if depth >= MAX_DEPTH or len(pack) >= MAX_TRACKS:
+        return
+
+    seen.add(browse_id)
+    related = _get_artist_related_list(browse_id)
+
+    if not related:
+        logger.debug("No related artists at depth %d for %s", depth, browse_id)
+        return
+
+    most_niche_candidate: tuple[str, int] | None = None   # (browse_id, sub_count)
+
+    for item in related:
+        if len(pack) >= MAX_TRACKS:
+            break
+
+        item_bid  = item.get("browseId")
+        item_name = item.get("title", "")
+        sub_str   = item.get("subscribers", "")
+
+        if not item_bid or item_bid in seen:
+            continue
+        if item_name.lower() in chart_names:
+            logger.debug("Skipping chart artist '%s'", item_name)
+            seen.add(item_bid)
+            continue
+
+        seen.add(item_bid)
+        sub_count = _parse_subscriber_count(sub_str)
+
+        # Diversification: max MAX_PER_ARTIST tracks from any one artist
+        if artist_counts.get(item_name, 0) >= MAX_PER_ARTIST:
+            continue
+
+        track = _find_track_in_window(item_name, min_views, max_views, depth)
+        if track:
+            track["subscriber_count"] = sub_count
+            pack.append(track)
+            artist_counts[item_name] = artist_counts.get(item_name, 0) + 1
+            logger.info(
+                "[depth %d] Added '%s' by %s (%d views, score %d)",
+                depth, track["title"], item_name,
+                track["view_count"], track["niche_score"],
+            )
+        else:
+            # Candidate for deeper recursion — track the most niche (fewest subs)
+            if most_niche_candidate is None or sub_count < most_niche_candidate[1]:
+                most_niche_candidate = (item_bid, sub_count)
+
+    # Recurse into the most niche untapped branch if the pack is still short
+    if len(pack) < MAX_TRACKS and most_niche_candidate:
+        logger.info(
+            "Pack needs %d more — recursing to depth %d",
+            MAX_TRACKS - len(pack), depth + 1,
+        )
+        _find_tracks_within_window(
+            browse_id=most_niche_candidate[0],
+            min_views=min_views,
+            max_views=max_views,
+            chart_names=chart_names,
+            depth=depth + 1,
+            seen=seen,
+            pack=pack,
+            artist_counts=artist_counts,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -184,29 +292,39 @@ def get_niche_tracks(
     niche_value:  float = 0.5,
 ) -> list[dict]:
     """
-    Discover niche tracks via two-degree artist graph expansion + view-count gating.
+    Discover niche tracks via recursive related-artist traversal.
 
     Parameters
     ----------
     seed_artists:
         Artist names to seed the graph walk.
     niche_value:
-        Float 0.0–1.0 controlling the view-count ceiling via a log scale.
-        0.0 = only tracks with < 1k views; 1.0 = allows up to 100M views.
+        Float 0.0–1.0. Controls the view-count window ceiling via
+        ``10 ** (4.6 + niche_value * 3.4)``. The floor is always 40k views.
 
     Returns
     -------
-    List of dicts (sorted by niche_score descending) with keys:
-        artist, title, youtube_id, view_count, niche_score, subscriber_count.
+    Up to 5 track dicts, sorted by niche_score descending, from at least
+    3 different artists. Each dict contains:
+        artist, title, youtube_id, view_count, niche_score,
+        depth_level, subscriber_count.
     """
+    min_views = MIN_VIEWS
     max_views = _compute_max_views(niche_value)
+
     logger.info(
-        "Niche engine starting — niche_value=%.2f → max_views=%d", niche_value, max_views
+        "Niche engine — niche_value=%.2f, window=[%d, %d]",
+        niche_value, min_views, max_views,
     )
 
-    # ------------------------------------------------------------------
-    # Step 1: Resolve seed browseIds
-    # ------------------------------------------------------------------
+    if max_views <= min_views:
+        logger.warning(
+            "max_views (%d) ≤ min_views (%d) — window is empty at this niche_value",
+            max_views, min_views,
+        )
+        return []
+
+    # Resolve seed artists to browseIds
     seed_ids: list[str] = []
     for name in seed_artists:
         bid = _resolve_browse_id(name)
@@ -219,95 +337,37 @@ def get_niche_tracks(
         logger.error("No valid seed artists — cannot continue")
         return []
 
-    # ------------------------------------------------------------------
-    # Step 2: First-degree related artists
-    # browseId → {"name": str, "subscriber_str": str}
-    # ------------------------------------------------------------------
-    seen: set[str] = set(seed_ids)
-    first_degree: dict[str, dict] = {}
+    chart_names   = _get_chart_artist_names()
+    pack:          list[dict]       = []
+    seen:          set[str]         = set(seed_ids)
+    artist_counts: dict[str, int]   = {}
 
-    for bid in seed_ids:
-        for item in _get_related_artists(bid):
-            item_bid = item.get("browseId")
-            if item_bid and item_bid not in seen:
-                first_degree[item_bid] = {
-                    "name":           item.get("title", ""),
-                    "subscriber_str": item.get("subscribers", ""),
-                }
-                seen.add(item_bid)
-
-    if not first_degree:
-        logger.warning("No first-degree related artists found for seeds: %s", seed_artists)
-        return []
-
-    # ------------------------------------------------------------------
-    # Step 3: Second-degree related artists (the jump)
-    # ------------------------------------------------------------------
-    second_degree: dict[str, dict] = {}
-
-    for bid, meta in first_degree.items():
-        for item in _get_related_artists(bid):
-            item_bid = item.get("browseId")
-            if item_bid and item_bid not in seen:
-                second_degree[item_bid] = {
-                    "name":           item.get("title", ""),
-                    "subscriber_str": item.get("subscribers", ""),
-                }
-                seen.add(item_bid)
-
-    if not second_degree:
-        logger.warning("No second-degree related artists found — graph may be too shallow")
-        return []
-
-    # ------------------------------------------------------------------
-    # Step 4: Filter against global charts
-    # ------------------------------------------------------------------
-    chart_names = _get_chart_artist_names()
-    niche_pool  = {
-        bid: meta
-        for bid, meta in second_degree.items()
-        if meta["name"].lower() not in chart_names
-    }
-
-    if not niche_pool:
-        logger.warning(
-            "All %d second-degree artists filtered out by global charts", len(second_degree)
-        )
-        return []
-
-    logger.info(
-        "Niche pool: %d artists after removing %d chart hits",
-        len(niche_pool), len(second_degree) - len(niche_pool),
-    )
-
-    # ------------------------------------------------------------------
-    # Step 5: Find one track per niche artist within the view ceiling
-    # ------------------------------------------------------------------
-    tracks: list[dict] = []
-
-    for bid, meta in niche_pool.items():
-        if len(tracks) >= MAX_TRACKS:
+    for seed_id in seed_ids:
+        if len(pack) >= MAX_TRACKS:
             break
+        _find_tracks_within_window(
+            browse_id=seed_id,
+            min_views=min_views,
+            max_views=max_views,
+            chart_names=chart_names,
+            depth=0,
+            seen=seen,
+            pack=pack,
+            artist_counts=artist_counts,
+        )
 
-        artist_name      = meta["name"]
-        subscriber_count = _parse_subscriber_count(meta["subscriber_str"])
+    # Verify diversification (log only — pack may be short if graph is narrow)
+    distinct_artists = {t["artist"] for t in pack}
+    if len(distinct_artists) < 3 and len(pack) == MAX_TRACKS:
+        logger.warning(
+            "Diversification target not met: %d distinct artist(s) in pack",
+            len(distinct_artists),
+        )
 
-        track = _find_track_within_ceiling(artist_name, max_views)
-        if not track:
-            logger.debug(
-                "No track within ceiling for '%s' (subscriber_count=%d)",
-                artist_name, subscriber_count,
-            )
-            continue
-
-        track["subscriber_count"] = subscriber_count
-        tracks.append(track)
-
-    # Sort by niche_score descending — frontier tracks first
-    tracks.sort(key=lambda t: t["niche_score"], reverse=True)
+    pack.sort(key=lambda t: t["niche_score"], reverse=True)
 
     logger.info(
-        "Niche discovery complete: %d/%d tracks, ceiling=%d views",
-        len(tracks), MAX_TRACKS, max_views,
+        "Niche discovery complete: %d track(s) from %d artist(s), max depth reached",
+        len(pack), len(distinct_artists),
     )
-    return tracks
+    return pack

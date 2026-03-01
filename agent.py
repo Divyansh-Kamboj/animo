@@ -21,12 +21,6 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = (
-    "You are the Spirit of the Animo Community. Summarize this song's vibe "
-    "by blending the artist's intent with the latest user interpretations. "
-    "Keep it poetic, raw, and under 40 words."
-)
-
 # Single shared client — thread-safe; handles auth internally.
 _ai = AzureOpenAI(
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
@@ -40,11 +34,11 @@ _ai = AzureOpenAI(
 # ---------------------------------------------------------------------------
 
 def _fetch_track(track_id: str) -> dict | None:
-    """Return {title, artist, view_count, subscriber_count} for the track."""
+    """Return {title, artist, view_count, subscriber_count, depth_level} for the track."""
     try:
         response = (
             _db.table("tracks")
-            .select("title, artist, view_count, subscriber_count")
+            .select("title, artist, view_count, subscriber_count, depth_level")
             .eq("id", track_id)
             .single()
             .execute()
@@ -76,26 +70,43 @@ def _fetch_recent_comments(track_id: str, limit: int = 10) -> list[str]:
         return []
 
 
+_SYSTEM_PROMPT_SURFACE = (
+    "You are the Spirit of the Animo Community. Summarize this song's vibe "
+    "by blending the artist's intent with the latest user interpretations. "
+    "Keep it poetic, raw, and under 40 words."
+)
+
+_SYSTEM_PROMPT_DEEP = (
+    "You are the Spirit of the Animo Community. This track was unearthed from "
+    "deep inside the music graph — a hidden gem few have heard. Honour its rarity. "
+    "Summarize its vibe by blending the artist's intent with the latest user "
+    "interpretations. Keep it poetic, raw, and under 40 words."
+)
+
+
 def _call_model(
     artist: str,
     title: str,
     comments: list[str],
     view_count: int | None = None,
     subscriber_count: int | None = None,
+    depth_level: int | None = None,
 ) -> str | None:
     """Build the prompt and call GPT-4o. Returns the raw text response."""
-    deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o")
+    deployment    = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o")
+    system_prompt = _SYSTEM_PROMPT_DEEP if (depth_level or 0) > 1 else _SYSTEM_PROMPT_SURFACE
 
     comment_block = (
         "\n".join(f"- {c}" for c in comments) if comments else "(no comments yet)"
     )
 
-    # Discovery context — helps the model convey how undiscovered the artist is
     discovery_lines = []
     if view_count is not None:
         discovery_lines.append(f"YouTube views: {view_count:,}")
     if subscriber_count is not None:
         discovery_lines.append(f"Artist subscribers: {subscriber_count:,}")
+    if depth_level is not None:
+        discovery_lines.append(f"Discovery depth: {depth_level} (0 = surface, 3 = deepest)")
     discovery_block = (
         "Discovery context:\n" + "\n".join(discovery_lines)
         if discovery_lines else ""
@@ -112,7 +123,7 @@ def _call_model(
         completion = _ai.chat.completions.create(
             model=deployment,
             messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": user_prompt},
             ],
             max_tokens=80,   # 40-word cap ≈ 55 tokens; 80 gives comfortable headroom
@@ -179,6 +190,7 @@ def generate_new_vibe(track_id: str) -> str | None:
         comments,
         view_count=track.get("view_count"),
         subscriber_count=track.get("subscriber_count"),
+        depth_level=track.get("depth_level"),
     )
     if not vibe:
         return None
