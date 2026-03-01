@@ -122,11 +122,12 @@ def test_query(song_title: str, artist_name: str, niche_value: float = 0.5) -> N
     The artist is used as the niche-engine seed; the song title provides
     user-facing context only (the engine works at the artist graph level).
     """
-    max_views = int(10 ** (3 + niche_value * 5))
+    min_views = 40_000
+    max_views = int(10 ** (4.6 + niche_value * 3.4))
     print(f"\n{_BAR}")
     print(f"  Seed artist : {artist_name}")
     print(f"  Inspired by : {song_title}")
-    print(f"  Niche value : {niche_value}  →  ceiling = {max_views:,} views")
+    print(f"  Niche value : {niche_value}  →  window [{min_views:,}, {max_views:,}] views")
     print(_BAR)
 
     # ------------------------------------------------------------------
