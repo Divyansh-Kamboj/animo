@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+ytmusicapi
+spotipy
+supabase
+openai
+python-dotenv
+azure-functions
