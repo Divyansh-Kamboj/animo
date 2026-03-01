@@ -70,6 +70,12 @@ def _fetch_recent_comments(track_id: str, limit: int = 10) -> list[str]:
         return []
 
 
+_SYSTEM_PROMPT_INITIAL = (
+    "You are the Niche Scout. Introduce this track based solely on its metadata "
+    "and discovery depth. Use 20-30 words to set the expectation for its sound "
+    "and energy. Focus on mood, texture, and how underground it is."
+)
+
 _SYSTEM_PROMPT_SURFACE = (
     "You are the Spirit of the Animo Community. Summarize this song's vibe "
     "by blending the artist's intent with the latest user interpretations. "
@@ -93,12 +99,18 @@ def _call_model(
     depth_level: int | None = None,
 ) -> str | None:
     """Build the prompt and call GPT-4o. Returns the raw text response."""
-    deployment    = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o")
-    system_prompt = _SYSTEM_PROMPT_DEEP if (depth_level or 0) > 1 else _SYSTEM_PROMPT_SURFACE
+    deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o")
 
-    comment_block = (
-        "\n".join(f"- {c}" for c in comments) if comments else "(no comments yet)"
-    )
+    # Prompt strategy:
+    #   no comments → _SYSTEM_PROMPT_INITIAL  (metadata-only base vibe)
+    #   comments + depth > 1 → _SYSTEM_PROMPT_DEEP  (hidden gem + community blend)
+    #   comments + depth <= 1 → _SYSTEM_PROMPT_SURFACE  (community blend)
+    if not comments:
+        system_prompt = _SYSTEM_PROMPT_INITIAL
+    elif (depth_level or 0) > 1:
+        system_prompt = _SYSTEM_PROMPT_DEEP
+    else:
+        system_prompt = _SYSTEM_PROMPT_SURFACE
 
     discovery_lines = []
     if view_count is not None:
@@ -112,12 +124,16 @@ def _call_model(
         if discovery_lines else ""
     )
 
-    user_prompt = "\n".join(filter(None, [
+    user_prompt_parts = [
         f"Artist: {artist}",
         f"Song: {title}",
         discovery_block,
-        f"Recent community comments:\n{comment_block}",
-    ]))
+    ]
+    if comments:
+        comment_block = "\n".join(f"- {c}" for c in comments)
+        user_prompt_parts.append(f"Recent community comments:\n{comment_block}")
+
+    user_prompt = "\n".join(filter(None, user_prompt_parts))
 
     try:
         completion = _ai.chat.completions.create(

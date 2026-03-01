@@ -36,6 +36,9 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+# TEMPORARY: must match _TEST_USER_ID in main.py — remove with auth bypass
+_TEST_USER_ID = "00000000-0000-0000-0000-000000000001"
+
 _db: Client = create_client(
     supabase_url=os.environ.get("SUPABASE_URL", ""),
     supabase_key=os.environ.get("SUPABASE_KEY", ""),
@@ -46,7 +49,7 @@ _db: Client = create_client(
 # Public API
 # ---------------------------------------------------------------------------
 
-def save_track_to_db(track_data: dict) -> str | None:
+def save_track_to_db(track_data: dict, user_id: str | None = None) -> str | None:
     """
     Insert a track record and return its newly assigned UUID.
 
@@ -55,6 +58,9 @@ def save_track_to_db(track_data: dict) -> str | None:
     track_data:
         Must contain ``title``, ``artist``, ``youtube_id``.
         May contain ``spotify_img`` (str) and ``genre_tags`` (list[str]).
+    user_id:
+        UUID of the user who discovered this track. Stored so tracks can be
+        filtered per-user via GET /my-tracks.
 
     Returns
     -------
@@ -69,6 +75,8 @@ def save_track_to_db(track_data: dict) -> str | None:
         "view_count":       track_data.get("view_count"),
         "subscriber_count": track_data.get("subscriber_count"),
         "depth_level":      track_data.get("depth_level"),
+        "niche_score":      track_data.get("niche_score"),
+        "user_id":          user_id,
     }
 
     try:
@@ -83,6 +91,27 @@ def save_track_to_db(track_data: dict) -> str | None:
     except Exception:
         logger.error("Failed to insert track '%s'", payload.get("title"), exc_info=True)
         return None
+
+
+def get_user_tracks(user_id: str) -> list[dict]:
+    """
+    Return all tracks discovered by the given user, newest first.
+
+    Returns the full track row so the frontend can reconstruct TrackData
+    without an additional enrichment step.
+    """
+    try:
+        response = (
+            _db.table("tracks")
+            .select("*")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        return response.data or []
+    except Exception:
+        logger.warning("Could not fetch tracks for user %s", user_id, exc_info=True)
+        return []
 
 
 def increment_vouch(track_id: str) -> bool:
@@ -165,40 +194,79 @@ def get_track_genres(track_id: str) -> list[str]:
         return []
 
 
-def get_user_favorite_genres(user_id: str) -> list[str]:
-    """Return favorite_genres from user_profiles, or empty list if no profile yet."""
+def get_track_comments(track_id: str, limit: int = 50) -> list[dict]:
+    """Return the most recent comments for a track, newest first."""
+    try:
+        response = (
+            _db.table("comments")
+            .select("text, created_at")
+            .eq("track_id", track_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return response.data or []
+    except Exception:
+        logger.warning("Could not fetch comments for track %s", track_id, exc_info=True)
+        return []
+
+
+def get_track_vibe(track_id: str) -> str | None:
+    """Return vibe_description for a track, or None if not yet generated."""
+    try:
+        response = (
+            _db.table("tracks")
+            .select("vibe_description")
+            .eq("id", track_id)
+            .single()
+            .execute()
+        )
+        return response.data.get("vibe_description")
+    except Exception:
+        logger.warning("Could not fetch vibe for track %s", track_id, exc_info=True)
+        return None
+
+
+def get_user_favorite_genres(user_id: str | None) -> list[str]:
+    """Return favorite_genres from user_profiles, or empty list if no profile yet.
+
+    Falls back to _TEST_USER_ID when ``user_id`` is None (auth-bypass mode).
+    """
+    uid = user_id or _TEST_USER_ID
     try:
         response = (
             _db.table("user_profiles")
             .select("favorite_genres")
-            .eq("id", user_id)
+            .eq("id", uid)
             .single()
             .execute()
         )
         return response.data.get("favorite_genres") or []
     except Exception:
-        logger.warning("Could not fetch profile for user %s", user_id, exc_info=True)
+        logger.warning("Could not fetch profile for user %s", uid, exc_info=True)
         return []
 
 
-def upsert_user_genres(user_id: str, new_genres: list[str]) -> None:
+def upsert_user_genres(user_id: str | None, new_genres: list[str]) -> None:
     """
     Merge ``new_genres`` into ``user_profiles.favorite_genres`` for the user.
 
     Uses an ordered dedup so earlier (longer-standing) preferences stay first.
     Upserts the profile row so the first vouch creates the profile automatically.
+    Falls back to _TEST_USER_ID when ``user_id`` is None (auth-bypass mode).
     """
-    current = get_user_favorite_genres(user_id)
+    uid = user_id or _TEST_USER_ID
+    current = get_user_favorite_genres(uid)
     # dict.fromkeys preserves order while deduplicating
     merged = list(dict.fromkeys(current + new_genres))
     try:
         _db.table("user_profiles").upsert(
-            {"id": user_id, "favorite_genres": merged},
+            {"id": uid, "favorite_genres": merged},
             on_conflict="id",
         ).execute()
-        logger.info("Upserted genres for user %s: %s", user_id, merged)
+        logger.info("Upserted genres for user %s: %s", uid, merged)
     except Exception:
-        logger.error("Could not upsert genres for user %s", user_id, exc_info=True)
+        logger.error("Could not upsert genres for user %s", uid, exc_info=True)
 
 
 def get_user_taste(user_id: str) -> list[str]:

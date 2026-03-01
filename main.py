@@ -28,13 +28,23 @@ app.include_router(health.router)
 
 _bearer = HTTPBearer(auto_error=False)
 
+# ---------------------------------------------------------------------------
+# TEMPORARY: Auth bypass for local testing — replace UUID, remove before prod
+# ---------------------------------------------------------------------------
+# Paste any real UUID from your Supabase auth.users table here.
+_TEST_USER_ID = "00000000-0000-0000-0000-000000000001"  # TODO: replace with real UUID
+
 
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
 
 def _decode_token(token: str) -> str:
-    """Verify a Supabase JWT and return the user UUID (sub claim)."""
+    """Verify a Supabase JWT and return the user UUID (sub claim).
+
+    During the auth-bypass testing period any expired or invalid token falls
+    back to _TEST_USER_ID instead of raising 401.
+    """
     try:
         payload = jwt.decode(
             token,
@@ -44,27 +54,31 @@ def _decode_token(token: str) -> str:
         )
         return payload["sub"]
     except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token has expired.")
+        logger.warning("Token expired — falling back to test user %s", _TEST_USER_ID)
+        return _TEST_USER_ID
     except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token.")
+        logger.warning("Invalid token — falling back to test user %s", _TEST_USER_ID)
+        return _TEST_USER_ID
 
 
 def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> str:
-    """Dependency — requires a valid Bearer token; raises 401 otherwise."""
+    """Dependency — returns a valid user UUID or the test-bypass UUID."""
     if credentials is None:
-        raise HTTPException(status_code=401, detail="Authorization header required.")
+        logger.warning("No Authorization header — falling back to test user %s", _TEST_USER_ID)
+        return _TEST_USER_ID
     return _decode_token(credentials.credentials)
 
 
 def get_optional_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> str | None:
-    """Dependency — returns the user UUID if a valid token is present, else None."""
+    """Dependency — returns the user UUID if a valid token is present, else test-bypass UUID."""
     if credentials is None:
-        return None
-    return _decode_token(credentials.credentials)  # still raises 401 on bad tokens
+        logger.warning("No Authorization header — falling back to test user %s", _TEST_USER_ID)
+        return _TEST_USER_ID
+    return _decode_token(credentials.credentials)
 
 
 # ---------------------------------------------------------------------------
@@ -83,8 +97,10 @@ def _sync_user_genres_from_vouch(user_id: str, track_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 class SurveyRequest(BaseModel):
-    seed_artists: list[str]
-    niche_value:  float = 0.5   # 0.0 = ultra-underground, 1.0 = mainstream allowed
+    seed_artists:    list[str]
+    niche_value:     float = 0.5   # 0.0 = ultra-underground, 1.0 = mainstream allowed
+    vibe:            str   = ""    # e.g. "High Energy / Digital"
+    selected_genres: list[str] = []  # up to 3 genre tags chosen by the user
 
 
 class CommentRequest(BaseModel):
@@ -104,18 +120,30 @@ def root():
 @app.post("/open-pack")
 def open_pack(
     survey: SurveyRequest,
+    background_tasks: BackgroundTasks,
     user_id: str | None = Depends(get_optional_user),
 ):
     """
     Receive a survey from Person A, run the niche engine, enrich each track
     with Spotify metadata, persist to Supabase, and return the full objects.
 
+    Immediately queues a background vibe generation for every new track so
+    the 'Base Vibe' description is being written while the user browses the pack.
+
     If the request includes a valid user token, the user's saved genre
     preferences are appended to the seed list so the discovery graph is
     biased toward their taste history.
     """
+    logger.info(
+        "open-pack — vibe=%r, selected_genres=%s, niche_value=%.2f, seeds=%s",
+        survey.vibe, survey.selected_genres, survey.niche_value, survey.seed_artists,
+    )
+
     # 1. Blend survey seeds with the user's genre preferences (if logged in)
+    #    Seed order: explicit artists → selected genres → historical user genres
     seeds = list(survey.seed_artists)
+    if survey.selected_genres:
+        seeds = seeds + survey.selected_genres
     if user_id:
         user_genres = database.get_user_favorite_genres(user_id)
         if user_genres:
@@ -130,7 +158,7 @@ def open_pack(
             detail="Niche discovery returned no tracks. Try different seed artists.",
         )
 
-    # 3. Enrich each track with Spotify metadata and persist
+    # 3. Enrich each track with Spotify metadata, persist, and queue base vibe
     results = []
     for track in raw_tracks:
         enriched = metadata.enrich_track_data(
@@ -139,12 +167,18 @@ def open_pack(
         )
         full_track = {**track, **enriched}
 
-        db_id = database.save_track_to_db(full_track)
+        db_id = database.save_track_to_db(full_track, user_id=user_id)
         if db_id is None:
             logger.warning("Could not save track '%s' — skipping", full_track.get("title"))
             continue
 
-        results.append({"id": db_id, **full_track})
+        # Queue immediate base-vibe generation (no comments yet → uses _SYSTEM_PROMPT_INITIAL)
+        background_tasks.add_task(agent.generate_new_vibe, db_id)
+
+        # vibe_description will be null on first response (AI is generating in background);
+        # return a placeholder so the frontend always has something to display.
+        vibe_description = database.get_track_vibe(db_id) or "Tuning into the vibe..."
+        results.append({"id": db_id, "vibe_description": vibe_description, **full_track})
 
     if not results:
         raise HTTPException(
@@ -153,6 +187,18 @@ def open_pack(
         )
 
     return results
+
+
+@app.get("/my-tracks")
+def my_tracks(user_id: str = Depends(get_current_user)):
+    """Return all tracks discovered by the authenticated user, newest first."""
+    return database.get_user_tracks(user_id)
+
+
+@app.get("/comments/{track_id}")
+def get_comments(track_id: str):
+    """Return the most recent 50 comments for a track, newest first."""
+    return database.get_track_comments(track_id)
 
 
 @app.post("/vouch/{track_id}")
@@ -187,7 +233,7 @@ def comment(body: CommentRequest, background_tasks: BackgroundTasks):
     if count is None:
         raise HTTPException(status_code=500, detail="Could not save comment.")
 
-    if count % 10 == 0:
+    if count % 5 == 0:
         logger.info(
             "Comment count hit %d for track %s — queueing vibe regeneration",
             count, body.track_id,
