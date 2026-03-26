@@ -8,12 +8,15 @@ Depth is capped at MAX_DEPTH to prevent infinite loops.
 
 import logging
 import re
+import time
 
 from ytmusicapi import YTMusic
 
 logger = logging.getLogger(__name__)
 
 _ytmusic = YTMusic()
+_SEARCH_CACHE_TTL_SECONDS = 20
+_search_cache: dict[str, tuple[float, list[dict]]] = {}
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -67,6 +70,19 @@ def _parse_subscriber_count(subscriber_str: str | None) -> int:
         return 0
     number = float(match.group(1))
     mult   = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}.get(match.group(2), 1)
+    return int(number * mult)
+
+
+def _parse_views_string(views_str: str | None) -> int | None:
+    """Best-effort parse for view strings like '123K views'."""
+    if not views_str:
+        return None
+    token = views_str.strip().split()[0].replace(",", "").lower()
+    match = re.match(r"^([\d.]+)([kmb]?)$", token)
+    if not match:
+        return None
+    number = float(match.group(1))
+    mult = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}.get(match.group(2), 1)
     return int(number * mult)
 
 
@@ -125,6 +141,25 @@ def _get_view_count(video_id: str) -> int | None:
     except Exception:
         logger.debug("Could not fetch view count for '%s'", video_id, exc_info=True)
     return None
+
+
+def _extract_artist_name(song_result: dict) -> str:
+    """Best-effort artist name extraction from a ytmusic song search result."""
+    artists = song_result.get("artists")
+    if isinstance(artists, list) and artists:
+        name = artists[0].get("name")
+        if name:
+            return name
+
+    artist_field = song_result.get("artist")
+    if isinstance(artist_field, dict):
+        name = artist_field.get("name")
+        if name:
+            return name
+    if isinstance(artist_field, str):
+        return artist_field
+
+    return "Unknown Artist"
 
 
 def _get_chart_artist_names() -> set[str]:
@@ -371,3 +406,64 @@ def get_niche_tracks(
         len(pack), len(distinct_artists),
     )
     return pack
+
+
+def search_global_songs(query: str, limit: int = 5) -> list[dict]:
+    """
+    Search YouTube Music globally for songs and return a compact result list.
+
+    Each item contains:
+        title, artist, youtube_id, view_count, niche_score, depth_level, subscriber_count
+    """
+    q = query.strip()
+    if not q:
+        return []
+
+    cache_key = q.lower()
+    now = time.time()
+    cached = _search_cache.get(cache_key)
+    if cached and (now - cached[0]) < _SEARCH_CACHE_TTL_SECONDS:
+        return cached[1][:limit]
+
+    try:
+        results = _ytmusic.search(q, filter="songs")
+    except Exception:
+        logger.error("Global song search failed for query '%s'", q, exc_info=True)
+        return []
+
+    parsed: list[dict] = []
+
+    for item in results:
+        if len(parsed) >= limit:
+            break
+
+        video_id = item.get("videoId")
+        title = item.get("title")
+        if not video_id or not title:
+            continue
+
+        artist_name = _extract_artist_name(item)
+        # Keep live search fast: rely on lightweight fields from search results.
+        view_count = _parse_views_string(item.get("views"))
+
+        parsed.append(
+            {
+                "title": title,
+                "artist": artist_name,
+                "youtube_id": video_id,
+                "view_count": view_count,
+                "niche_score": None,
+                "depth_level": 0,
+                "subscriber_count": None,
+            }
+        )
+
+    _search_cache[cache_key] = (now, parsed)
+    return parsed
+
+
+def enrich_track_data(artist_name: str, song_name: str) -> dict:
+    """Discovery-facing metadata enrichment wrapper used by API routes."""
+    from metadata import enrich_track_data as _enrich_track_data
+
+    return _enrich_track_data(artist_name=artist_name, song_name=song_name)

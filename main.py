@@ -2,7 +2,7 @@ import logging
 import os
 
 import jwt
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
@@ -10,7 +10,6 @@ from pydantic import BaseModel
 import agent
 import database
 import discovery
-import metadata
 from api.routes import health
 
 logger = logging.getLogger(__name__)
@@ -108,6 +107,31 @@ class CommentRequest(BaseModel):
     text: str
 
 
+class GlobalTrackRequest(BaseModel):
+    youtube_id: str
+    title: str
+    artist: str
+    view_count: int | None = None
+
+
+def _to_animo_card(track: dict) -> dict:
+    """Normalize a DB row or enriched track payload to frontend card shape."""
+    return {
+        "id": track.get("id"),
+        "artist": track.get("artist", ""),
+        "title": track.get("title", ""),
+        "youtube_id": track.get("youtube_id", ""),
+        "view_count": track.get("view_count"),
+        "niche_score": track.get("niche_score"),
+        "depth_level": track.get("depth_level"),
+        "subscriber_count": track.get("subscriber_count"),
+        "spotify_img": track.get("spotify_img"),
+        "genre_tags": track.get("genre_tags") or [],
+        "spotify_id": track.get("spotify_id"),
+        "vibe_description": track.get("vibe_description"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -161,7 +185,7 @@ def open_pack(
     # 3. Enrich each track with Spotify metadata, persist, and queue base vibe
     results = []
     for track in raw_tracks:
-        enriched = metadata.enrich_track_data(
+        enriched = discovery.enrich_track_data(
             artist_name=track.get("artist", ""),
             song_name=track.get("title", ""),
         )
@@ -193,6 +217,53 @@ def open_pack(
 def my_tracks(user_id: str = Depends(get_current_user)):
     """Return all tracks discovered by the authenticated user, newest first."""
     return database.get_user_tracks(user_id)
+
+
+@app.get("/search-global")
+def search_global(q: str = Query(..., min_length=1)):
+    """Global YouTube Music search — returns up to top 5 song matches."""
+    results = discovery.search_global_songs(q, limit=5)
+    return {"results": results}
+
+
+@app.post("/search-global/select")
+def select_global_track(
+    body: GlobalTrackRequest,
+    user_id: str | None = Depends(get_optional_user),
+):
+    """
+    Resolve a selected global search result into a full Animo card.
+
+    - If the track already exists in ``tracks``, return it directly.
+    - Otherwise enrich it, save it, generate vibe immediately, and return it.
+    """
+    existing = database.get_track_by_youtube_id(body.youtube_id)
+    if existing:
+        return _to_animo_card(existing)
+
+    base_track = {
+        "title": body.title,
+        "artist": body.artist,
+        "youtube_id": body.youtube_id,
+        "view_count": body.view_count,
+        "niche_score": None,
+        "depth_level": 0,
+        "subscriber_count": None,
+    }
+    enriched = discovery.enrich_track_data(
+        artist_name=base_track["artist"],
+        song_name=base_track["title"],
+    )
+    full_track = {**base_track, **enriched}
+
+    db_id = database.save_track_to_db(full_track, user_id=user_id)
+    if db_id is None:
+        raise HTTPException(status_code=500, detail="Could not save selected track.")
+
+    vibe = agent.generate_new_vibe(db_id)
+    full_track["id"] = db_id
+    full_track["vibe_description"] = vibe or database.get_track_vibe(db_id)
+    return _to_animo_card(full_track)
 
 
 @app.get("/comments/{track_id}")

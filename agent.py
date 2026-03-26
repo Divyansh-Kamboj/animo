@@ -2,7 +2,7 @@
 agent.py — Animo Living Description Agent
 
 Uses Azure OpenAI (GPT-4o) to regenerate a track's 'vibe_description'
-by blending the artist context with the 10 most recent community comments.
+by blending the artist context with the 10 most recent listener comments.
 
 Expected schema addition
 ------------------------
@@ -77,13 +77,13 @@ _SYSTEM_PROMPT_INITIAL = (
 )
 
 _SYSTEM_PROMPT_SURFACE = (
-    "You are the Spirit of the Animo Community. Summarize this song's vibe "
-    "by blending the artist's intent with the latest user interpretations. "
+    "You are the Spirit of Animo listeners. Summarize this song's vibe "
+    "by blending the artist's intent with the latest listener interpretations. "
     "Keep it poetic, raw, and under 40 words."
 )
 
 _SYSTEM_PROMPT_DEEP = (
-    "You are the Spirit of the Animo Community. This track was unearthed from "
+    "You are the Spirit of Animo listeners. This track was unearthed from "
     "deep inside the music graph — a hidden gem few have heard. Honour its rarity. "
     "Summarize its vibe by blending the artist's intent with the latest user "
     "interpretations. Keep it poetic, raw, and under 40 words."
@@ -103,8 +103,8 @@ def _call_model(
 
     # Prompt strategy:
     #   no comments → _SYSTEM_PROMPT_INITIAL  (metadata-only base vibe)
-    #   comments + depth > 1 → _SYSTEM_PROMPT_DEEP  (hidden gem + community blend)
-    #   comments + depth <= 1 → _SYSTEM_PROMPT_SURFACE  (community blend)
+    #   comments + depth > 1 → _SYSTEM_PROMPT_DEEP  (hidden gem + listener blend)
+    #   comments + depth <= 1 → _SYSTEM_PROMPT_SURFACE  (listener blend)
     if not comments:
         system_prompt = _SYSTEM_PROMPT_INITIAL
     elif (depth_level or 0) > 1:
@@ -131,7 +131,7 @@ def _call_model(
     ]
     if comments:
         comment_block = "\n".join(f"- {c}" for c in comments)
-        user_prompt_parts.append(f"Recent community comments:\n{comment_block}")
+        user_prompt_parts.append(f"Recent listener comments:\n{comment_block}")
 
     user_prompt = "\n".join(filter(None, user_prompt_parts))
 
@@ -175,7 +175,7 @@ def generate_new_vibe(track_id: str) -> str | None:
     Regenerate and persist the living vibe description for a track.
 
     Fetches the track metadata and its 10 most recent comments, sends them
-    to GPT-4o with a community-spirit system prompt, then writes the result
+    to GPT-4o with a listener-spirit system prompt, then writes the result
     back to ``tracks.vibe_description``.
 
     Parameters

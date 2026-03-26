@@ -114,6 +114,26 @@ def get_user_tracks(user_id: str) -> list[dict]:
         return []
 
 
+def get_track_by_youtube_id(youtube_id: str) -> dict | None:
+    """Return the most recent track row matching a YouTube video ID."""
+    try:
+        response = (
+            _db.table("tracks")
+            .select("*")
+            .eq("youtube_id", youtube_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = response.data or []
+        return rows[0] if rows else None
+    except Exception:
+        logger.warning(
+            "Could not fetch track by youtube_id %s", youtube_id, exc_info=True
+        )
+        return None
+
+
 def increment_vouch(track_id: str) -> bool:
     """
     Atomically increment the ``vouch_count`` for a track by 1.

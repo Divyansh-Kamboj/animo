@@ -3,7 +3,7 @@
 Animo Ghost Seeder
 ==================
 Populates the Supabase database with "ghost user" tracks and comments so that
-Vibe Hubs look active when the app first loads.
+the app feels active when it first loads.
 
 Usage:
     pip install requests
@@ -28,7 +28,7 @@ except ImportError:
 API_BASE = "http://localhost:8000"
 
 # ---------------------------------------------------------------------------
-# Ghost community comments — realistic, evocative, non-spammy
+# Ghost listener comments — realistic, evocative, non-spammy
 # ---------------------------------------------------------------------------
 GHOST_COMMENTS = [
     "This changed everything for me. Pure signal.",
