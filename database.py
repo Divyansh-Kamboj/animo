@@ -111,6 +111,22 @@ def get_user_tracks(user_id: str) -> list[dict]:
         return []
 
 
+def get_track_by_id(track_id: str) -> dict | None:
+    """Return a single track row by primary id, or None if not found."""
+    try:
+        response = (
+            _db.table("tracks")
+            .select("*")
+            .eq("id", track_id)
+            .single()
+            .execute()
+        )
+        return response.data
+    except Exception:
+        logger.info("No track found with id %s", track_id)
+        return None
+
+
 def get_track_by_youtube_id(youtube_id: str) -> dict | None:
     """Return the most recent track row matching a YouTube video ID."""
     try:

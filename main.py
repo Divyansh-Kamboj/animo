@@ -255,6 +255,15 @@ def my_tracks(user_id: str = Depends(get_current_user)):
     return database.get_user_tracks(user_id)
 
 
+@app.get("/tracks/{track_id}")
+def get_track(track_id: str):
+    """Return one track by id (public — track rows are world-readable)."""
+    track = database.get_track_by_id(track_id)
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+    return _to_animo_card(track)
+
+
 @app.get("/search-global")
 def search_global(q: str = Query(..., min_length=1)):
     """Global YouTube Music search — returns up to top 5 song matches."""
