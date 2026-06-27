@@ -160,36 +160,32 @@ def root():
 def open_pack(
     survey: SurveyRequest,
     background_tasks: BackgroundTasks,
-    user_id: str | None = Depends(get_optional_user),
+    user_id: str = Depends(get_current_user),
 ):
-    """
-    Receive a survey from Person A, run the niche engine, enrich each track
-    with Spotify metadata, persist to Supabase, and return the full objects.
+    """Run the niche engine for the authenticated user and return enriched tracks.
 
-    Immediately queues a background vibe generation for every new track so
-    the 'Base Vibe' description is being written while the user browses the pack.
-
-    If the request includes a valid user token, the user's saved genre
-    preferences are appended to the seed list so the discovery graph is
-    biased toward their taste history.
+    Side effects on success:
+      - Each discovered track is persisted to ``tracks`` with this user_id.
+      - The user's ``user_profiles`` row is upserted with the survey snapshot
+        and ``onboarding_complete = true``.
+      - ``last_pack_opened_at`` is stamped server-side so the 24h gate works.
+      - A background vibe-generation task is queued per track.
     """
     logger.info(
-        "open-pack — vibe=%r, selected_genres=%s, niche_value=%.2f, seeds=%s",
-        survey.vibe, survey.selected_genres, survey.niche_value, survey.seed_artists,
+        "open-pack user=%s vibe=%r selected_genres=%s niche=%.2f seeds=%s",
+        user_id, survey.vibe, survey.selected_genres,
+        survey.niche_value, survey.seed_artists,
     )
 
-    # 1. Blend survey seeds with the user's genre preferences (if logged in)
-    #    Seed order: explicit artists → selected genres → historical user genres
+    # Seed order: explicit artists -> selected genres -> historical user genres
     seeds = list(survey.seed_artists)
     if survey.selected_genres:
         seeds = seeds + survey.selected_genres
-    if user_id:
-        user_genres = database.get_user_favorite_genres(user_id)
-        if user_genres:
-            logger.info("Blending %d user genre seeds for user %s", len(user_genres), user_id)
-            seeds = seeds + user_genres  # genres resolve as YT Music topics/artists
+    user_genres = database.get_user_favorite_genres(user_id)
+    if user_genres:
+        logger.info("Blending %d historical genre seeds for %s", len(user_genres), user_id)
+        seeds = seeds + user_genres
 
-    # 2. Discover niche tracks
     raw_tracks = discovery.get_niche_tracks(seeds, niche_value=survey.niche_value)
     if not raw_tracks:
         raise HTTPException(
@@ -197,7 +193,6 @@ def open_pack(
             detail="Niche discovery returned no tracks. Try different seed artists.",
         )
 
-    # 3. Enrich each track with Spotify metadata, persist, and queue base vibe
     results = []
     for track in raw_tracks:
         enriched = discovery.enrich_track_data(
@@ -211,11 +206,7 @@ def open_pack(
             logger.warning("Could not save track '%s' — skipping", full_track.get("title"))
             continue
 
-        # Queue immediate base-vibe generation (no comments yet → uses _SYSTEM_PROMPT_INITIAL)
         background_tasks.add_task(agent.generate_new_vibe, db_id)
-
-        # vibe_description will be null on first response (AI is generating in background);
-        # return a placeholder so the frontend always has something to display.
         vibe_description = database.get_track_vibe(db_id) or "Tuning into the vibe..."
         results.append({"id": db_id, "vibe_description": vibe_description, **full_track})
 
@@ -225,7 +216,37 @@ def open_pack(
             detail="Tracks were discovered but could not be saved to the database.",
         )
 
+    # Snapshot the survey + bump pack timestamp once everything succeeded
+    database.save_survey_and_mark_pack_opened(
+        user_id,
+        seeds=list(survey.seed_artists),
+        vibe=survey.vibe,
+        niche=survey.niche_value,
+        genres=list(survey.selected_genres),
+    )
+
     return results
+
+
+@app.get("/me")
+def me(user_id: str = Depends(get_current_user)):
+    """Return the authenticated user's profile (or a sensible default if missing).
+
+    The frontend uses ``onboarding_complete`` to gate the survey, and
+    ``last_pack_opened_at`` + ``survey_*`` to decide whether to open today's
+    pack reveal or jump straight to the hub.
+    """
+    profile = database.get_user_profile(user_id) or {}
+    return {
+        "id":                   user_id,
+        "onboarding_complete":  bool(profile.get("onboarding_complete")),
+        "last_pack_opened_at":  profile.get("last_pack_opened_at"),
+        "survey_seeds":         profile.get("survey_seeds")   or [],
+        "survey_vibe":          profile.get("survey_vibe")    or "",
+        "survey_niche":         profile.get("survey_niche"),
+        "survey_genres":        profile.get("survey_genres")  or [],
+        "favorite_genres":      profile.get("favorite_genres") or [],
+    }
 
 
 @app.get("/my-tracks")

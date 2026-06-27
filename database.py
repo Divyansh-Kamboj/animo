@@ -244,6 +244,54 @@ def get_track_vibe(track_id: str) -> str | None:
         return None
 
 
+def get_user_profile(user_id: str) -> dict | None:
+    """Return the full user_profiles row for ``user_id``, or None if missing."""
+    try:
+        response = (
+            _db.table("user_profiles")
+            .select("*")
+            .eq("id", user_id)
+            .single()
+            .execute()
+        )
+        return response.data
+    except Exception:
+        logger.info("No profile yet for user %s", user_id)
+        return None
+
+
+def save_survey_and_mark_pack_opened(
+    user_id: str,
+    *,
+    seeds: list[str],
+    vibe: str,
+    niche: float,
+    genres: list[str],
+) -> None:
+    """Snapshot the user's survey answers and stamp last_pack_opened_at = NOW().
+
+    Called from /open-pack after a successful discovery so a returning user
+    can regenerate the same flavour of pack tomorrow and the 24h gate has
+    a reference point. Sets onboarding_complete to True as a side effect.
+    """
+    payload = {
+        "id": user_id,
+        "survey_seeds":   seeds,
+        "survey_vibe":    vibe,
+        "survey_niche":   niche,
+        "survey_genres":  genres,
+        "onboarding_complete": True,
+    }
+    try:
+        _db.table("user_profiles").upsert(payload, on_conflict="id").execute()
+        # Stamp last_pack_opened_at server-side via a second update so we
+        # don't have to ship the timestamp from Python.
+        _db.rpc("touch_last_pack_opened", {"uid": user_id}).execute()
+        logger.info("Saved survey + bumped pack timestamp for user %s", user_id)
+    except Exception:
+        logger.error("Could not save survey for user %s", user_id, exc_info=True)
+
+
 def get_user_favorite_genres(user_id: str | None) -> list[str]:
     """Return favorite_genres from user_profiles, or empty list when no user / no profile."""
     if not user_id:
