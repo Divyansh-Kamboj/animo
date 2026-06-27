@@ -1,5 +1,10 @@
 # Secrets — never commit the real .env
 .env
+.env.bak
+.env.bak*
+
+# Spotipy OAuth token cache — contains a live bearer token
+.cache
 
 # Python
 __pycache__/
