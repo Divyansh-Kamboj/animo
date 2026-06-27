@@ -131,48 +131,81 @@ def get_track_by_youtube_id(youtube_id: str) -> dict | None:
         return None
 
 
-def increment_vouch(track_id: str) -> bool:
-    """
-    Atomically increment the ``vouch_count`` for a track by 1.
-
-    Uses a Postgres RPC to avoid a read-modify-write race condition.
-    See the module docstring for the required SQL function definition.
-
-    Returns
-    -------
-    ``True`` on success, ``False`` on failure.
-    """
+def get_track_vouch_count(track_id: str) -> int:
+    """Return current vouch_count for a track, or 0 on failure."""
     try:
-        _db.rpc("increment_vouch", {"row_id": track_id}).execute()
-        logger.info("Incremented vouch_count for track %s", track_id)
-        return True
+        response = (
+            _db.table("tracks")
+            .select("vouch_count")
+            .eq("id", track_id)
+            .single()
+            .execute()
+        )
+        return int(response.data.get("vouch_count") or 0)
     except Exception:
-        logger.error("Failed to increment vouch for track %s", track_id, exc_info=True)
-        return False
+        return 0
 
 
-def add_comment(track_id: str, text: str) -> int | None:
-    """
-    Insert a comment and return the updated total comment count for the track.
+def register_vouch(user_id: str, track_id: str) -> tuple[int, bool]:
+    """Idempotent vouch — at most one per (user, track).
 
-    The caller can use the returned count to detect multiples-of-ten triggers
-    (e.g. ``if count % 10 == 0: fire_event()``).
-
-    Parameters
-    ----------
-    track_id:
-        UUID of the parent track.
-    text:
-        Comment body.
+    Inserts a row into ``user_interactions`` with interaction_type='vouch';
+    the existing UNIQUE (user_id, track_id, interaction_type) constraint
+    prevents duplicates. If the insert succeeds (i.e. this is the first
+    vouch from this user for this track), ``vouch_count`` is incremented.
 
     Returns
     -------
-    Total number of comments for ``track_id`` after the insert,
-    or ``None`` on failure.
+    (vouch_count, was_new) — ``was_new`` is False when the user had already
+    vouched (idempotent no-op).
     """
     try:
-        _db.table("comments").insert({"track_id": track_id, "text": text}).execute()
-        logger.info("Added comment to track %s", track_id)
+        _db.table("user_interactions").insert({
+            "user_id": user_id,
+            "track_id": track_id,
+            "interaction_type": "vouch",
+        }).execute()
+        # Insert succeeded -> first vouch from this user for this track
+        _db.rpc("increment_vouch", {"row_id": track_id}).execute()
+        return get_track_vouch_count(track_id), True
+    except Exception as e:
+        # Most common path: unique-constraint violation -> already vouched.
+        # Anything else still leaves us with a sane read of the count.
+        msg = str(e).lower()
+        if "duplicate" in msg or "unique" in msg or "23505" in msg:
+            logger.info("User %s already vouched for %s — no-op", user_id, track_id)
+            return get_track_vouch_count(track_id), False
+        logger.error("Failed to register vouch", exc_info=True)
+        return get_track_vouch_count(track_id), False
+
+
+def get_user_vouched_track_ids(user_id: str) -> list[str]:
+    """Return the list of track_ids this user has already vouched for."""
+    try:
+        response = (
+            _db.table("user_interactions")
+            .select("track_id")
+            .eq("user_id", user_id)
+            .eq("interaction_type", "vouch")
+            .execute()
+        )
+        return [row["track_id"] for row in (response.data or [])]
+    except Exception:
+        logger.warning("Could not fetch vouches for %s", user_id, exc_info=True)
+        return []
+
+
+def add_comment(track_id: str, user_id: str, text: str) -> int | None:
+    """Insert a comment authored by ``user_id`` and return the new total count.
+
+    Returns ``None`` if the insert failed or the count couldn't be read.
+    """
+    try:
+        _db.table("comments").insert({
+            "track_id": track_id,
+            "user_id":  user_id,
+            "text":     text,
+        }).execute()
     except Exception:
         logger.error("Failed to insert comment for track %s", track_id, exc_info=True)
         return None
@@ -184,15 +217,67 @@ def add_comment(track_id: str, text: str) -> int | None:
             .eq("track_id", track_id)
             .execute()
         )
-        count = response.count
-        logger.info("Track %s now has %s comment(s)", track_id, count)
-        return count
+        return response.count
     except Exception:
-        logger.error(
-            "Comment inserted but count query failed for track %s", track_id, exc_info=True
-        )
-        # Comment was saved; return None to signal the count is unknown
+        logger.error("Comment saved but count failed for %s", track_id, exc_info=True)
         return None
+
+
+def _email_prefix(email: str | None) -> str:
+    """'alice@example.com' -> 'alice'. Returns 'anonymous' for falsy input."""
+    if not email or "@" not in email:
+        return "anonymous"
+    return email.split("@", 1)[0]
+
+
+def _resolve_user_labels(user_ids: list[str]) -> dict[str, str]:
+    """Best-effort lookup of email-prefix display labels for a batch of UUIDs.
+
+    Uses the admin auth API (service-role only). N+1 in the worst case but
+    deduped by caller; comment lists are bounded at 50 so it's fine for now.
+    """
+    labels: dict[str, str] = {}
+    for uid in user_ids:
+        try:
+            res = _db.auth.admin.get_user_by_id(uid)
+            user = getattr(res, "user", None) or (res.get("user") if isinstance(res, dict) else None)
+            email = getattr(user, "email", None) if user else None
+            labels[uid] = _email_prefix(email)
+        except Exception:
+            labels[uid] = "anonymous"
+    return labels
+
+
+def get_track_comments(track_id: str, limit: int = 50) -> list[dict]:
+    """Return recent comments for a track with author display labels.
+
+    Shape per item: {text, created_at, author}. Legacy rows where user_id
+    is NULL (pre-migration-009) come through as author='anonymous'.
+    """
+    try:
+        response = (
+            _db.table("comments")
+            .select("text, created_at, user_id")
+            .eq("track_id", track_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        rows = response.data or []
+    except Exception:
+        logger.warning("Could not fetch comments for track %s", track_id, exc_info=True)
+        return []
+
+    unique_uids = list({r["user_id"] for r in rows if r.get("user_id")})
+    labels = _resolve_user_labels(unique_uids) if unique_uids else {}
+    return [
+        {
+            "text": r["text"],
+            "created_at": r["created_at"],
+            "author": labels.get(r.get("user_id") or "", "anonymous"),
+        }
+        for r in rows
+    ]
 
 
 def get_track_genres(track_id: str) -> list[str]:
@@ -208,23 +293,6 @@ def get_track_genres(track_id: str) -> list[str]:
         return response.data.get("genre_tags") or []
     except Exception:
         logger.warning("Could not fetch genres for track %s", track_id, exc_info=True)
-        return []
-
-
-def get_track_comments(track_id: str, limit: int = 50) -> list[dict]:
-    """Return the most recent comments for a track, newest first."""
-    try:
-        response = (
-            _db.table("comments")
-            .select("text, created_at")
-            .eq("track_id", track_id)
-            .order("created_at", desc=True)
-            .limit(limit)
-            .execute()
-        )
-        return response.data or []
-    except Exception:
-        logger.warning("Could not fetch comments for track %s", track_id, exc_info=True)
         return []
 
 

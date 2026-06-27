@@ -304,39 +304,60 @@ def select_global_track(
 
 @app.get("/comments/{track_id}")
 def get_comments(track_id: str):
-    """Return the most recent 50 comments for a track, newest first."""
+    """Return the most recent 50 comments for a track, newest first.
+
+    Each comment carries an ``author`` display label (email prefix). Legacy
+    rows without a user_id come through as 'anonymous'.
+    """
     return database.get_track_comments(track_id)
+
+
+@app.get("/vouches")
+def my_vouches(user_id: str = Depends(get_current_user)):
+    """Return the track IDs the current user has already vouched for."""
+    return {"track_ids": database.get_user_vouched_track_ids(user_id)}
 
 
 @app.post("/vouch/{track_id}")
 def vouch(
     track_id: str,
     background_tasks: BackgroundTasks,
-    user_id: str | None = Depends(get_optional_user),
+    user_id: str = Depends(get_current_user),
 ):
-    """
-    Increment vouch_count for the given track by 1.
+    """Idempotent per-user vouch. At most one vouch per (user, track).
 
-    If the request includes a valid user token, the track's genre tags are
-    merged into the user's favorite_genres profile in the background.
+    Returns the updated vouch_count along with ``has_vouched=true``.
+    ``was_new`` is True only on the first successful vouch — useful for
+    optimistic UI rollback if the request was actually a no-op.
     """
-    success = database.increment_vouch(track_id)
-    if not success:
-        raise HTTPException(status_code=500, detail="Could not register vouch.")
-
-    if user_id:
+    vouch_count, was_new = database.register_vouch(user_id, track_id)
+    if was_new:
         background_tasks.add_task(_sync_user_genres_from_vouch, user_id, track_id)
-
-    return {"ok": True}
+    return {
+        "vouch_count": vouch_count,
+        "has_vouched": True,
+        "was_new":     was_new,
+    }
 
 
 @app.post("/comment")
-def comment(body: CommentRequest, background_tasks: BackgroundTasks):
+def comment(
+    body: CommentRequest,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user),
+):
+    """Save an authenticated comment and return the new total comment count.
+
+    Every 5th comment retriggers a background vibe-description regeneration
+    so the AI summary keeps tracking community sentiment.
     """
-    Save a comment and — when the running total hits a multiple of 10 —
-    regenerate the track's living vibe description in the background.
-    """
-    count = database.add_comment(body.track_id, body.text)
+    text = body.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Comment cannot be empty.")
+    if len(text) > 500:
+        raise HTTPException(status_code=400, detail="Comment is too long (max 500 chars).")
+
+    count = database.add_comment(body.track_id, user_id, text)
     if count is None:
         raise HTTPException(status_code=500, detail="Could not save comment.")
 
