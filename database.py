@@ -36,9 +36,6 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# TEMPORARY: must match _TEST_USER_ID in main.py — remove with auth bypass
-_TEST_USER_ID = "00000000-0000-0000-0000-000000000001"
-
 _db: Client = create_client(
     supabase_url=os.environ.get("SUPABASE_URL", ""),
     supabase_key=os.environ.get("SUPABASE_KEY", ""),
@@ -248,45 +245,41 @@ def get_track_vibe(track_id: str) -> str | None:
 
 
 def get_user_favorite_genres(user_id: str | None) -> list[str]:
-    """Return favorite_genres from user_profiles, or empty list if no profile yet.
-
-    Falls back to _TEST_USER_ID when ``user_id`` is None (auth-bypass mode).
-    """
-    uid = user_id or _TEST_USER_ID
+    """Return favorite_genres from user_profiles, or empty list when no user / no profile."""
+    if not user_id:
+        return []
     try:
         response = (
             _db.table("user_profiles")
             .select("favorite_genres")
-            .eq("id", uid)
+            .eq("id", user_id)
             .single()
             .execute()
         )
         return response.data.get("favorite_genres") or []
     except Exception:
-        logger.warning("Could not fetch profile for user %s", uid, exc_info=True)
+        logger.warning("Could not fetch profile for user %s", user_id, exc_info=True)
         return []
 
 
 def upsert_user_genres(user_id: str | None, new_genres: list[str]) -> None:
-    """
-    Merge ``new_genres`` into ``user_profiles.favorite_genres`` for the user.
+    """Merge ``new_genres`` into ``user_profiles.favorite_genres`` for the user.
 
-    Uses an ordered dedup so earlier (longer-standing) preferences stay first.
-    Upserts the profile row so the first vouch creates the profile automatically.
-    Falls back to _TEST_USER_ID when ``user_id`` is None (auth-bypass mode).
+    Ordered-dedup keeps longer-standing preferences first. The upsert creates
+    the profile row on first vouch. No-op when ``user_id`` is missing.
     """
-    uid = user_id or _TEST_USER_ID
-    current = get_user_favorite_genres(uid)
-    # dict.fromkeys preserves order while deduplicating
+    if not user_id:
+        return
+    current = get_user_favorite_genres(user_id)
     merged = list(dict.fromkeys(current + new_genres))
     try:
         _db.table("user_profiles").upsert(
-            {"id": uid, "favorite_genres": merged},
+            {"id": user_id, "favorite_genres": merged},
             on_conflict="id",
         ).execute()
-        logger.info("Upserted genres for user %s: %s", uid, merged)
+        logger.info("Upserted genres for user %s: %s", user_id, merged)
     except Exception:
-        logger.error("Could not upsert genres for user %s", uid, exc_info=True)
+        logger.error("Could not upsert genres for user %s", user_id, exc_info=True)
 
 
 def get_user_taste(user_id: str) -> list[str]:

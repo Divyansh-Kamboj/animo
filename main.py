@@ -16,9 +16,21 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Animo API", version="0.1.0")
 
+# Allowed origins for browser CORS. Production frontend domain should be
+# added here once deployed; never ship "*" in production.
+_ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.getenv(
+        "ANIMO_ALLOWED_ORIGINS",
+        "http://localhost:5173,http://localhost:8080,http://127.0.0.1:5173,http://127.0.0.1:8080",
+    ).split(",")
+    if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -27,57 +39,60 @@ app.include_router(health.router)
 
 _bearer = HTTPBearer(auto_error=False)
 
-# ---------------------------------------------------------------------------
-# TEMPORARY: Auth bypass for local testing — replace UUID, remove before prod
-# ---------------------------------------------------------------------------
-# Paste any real UUID from your Supabase auth.users table here.
-_TEST_USER_ID = "00000000-0000-0000-0000-000000000001"  # TODO: replace with real UUID
-
 
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
 
 def _decode_token(token: str) -> str:
-    """Verify a Supabase JWT and return the user UUID (sub claim).
+    """Verify a Supabase HS256 JWT and return the user UUID (sub claim).
 
-    During the auth-bypass testing period any expired or invalid token falls
-    back to _TEST_USER_ID instead of raising 401.
+    Raises HTTPException(401) on any decode failure. ``InvalidKeyError`` is a
+    sibling of ``InvalidTokenError`` (not a subclass), so it's caught
+    explicitly via the broad ``PyJWTError`` base.
     """
+    secret = os.getenv("SUPABASE_JWT_SECRET", "")
+    if not secret:
+        logger.error("SUPABASE_JWT_SECRET is not configured")
+        raise HTTPException(status_code=500, detail="Auth not configured")
     try:
         payload = jwt.decode(
             token,
-            os.getenv("SUPABASE_JWT_SECRET", ""),
+            secret,
             algorithms=["HS256"],
             audience="authenticated",
         )
         return payload["sub"]
     except jwt.ExpiredSignatureError:
-        logger.warning("Token expired — falling back to test user %s", _TEST_USER_ID)
-        return _TEST_USER_ID
-    except jwt.InvalidTokenError:
-        logger.warning("Invalid token — falling back to test user %s", _TEST_USER_ID)
-        return _TEST_USER_ID
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.PyJWTError as e:
+        logger.warning("JWT decode failed: %s", e)
+        raise HTTPException(status_code=401, detail="Invalid token")
 
 
 def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> str:
-    """Dependency — returns a valid user UUID or the test-bypass UUID."""
+    """Dependency — returns the authenticated user UUID. 401 if not present or invalid."""
     if credentials is None:
-        logger.warning("No Authorization header — falling back to test user %s", _TEST_USER_ID)
-        return _TEST_USER_ID
+        raise HTTPException(status_code=401, detail="Authentication required")
     return _decode_token(credentials.credentials)
 
 
 def get_optional_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> str | None:
-    """Dependency — returns the user UUID if a valid token is present, else test-bypass UUID."""
+    """Dependency — returns the user UUID if a valid token is present, else None.
+
+    Unlike ``get_current_user`` this never raises — endpoints that allow
+    anonymous access can use it and branch on the result.
+    """
     if credentials is None:
-        logger.warning("No Authorization header — falling back to test user %s", _TEST_USER_ID)
-        return _TEST_USER_ID
-    return _decode_token(credentials.credentials)
+        return None
+    try:
+        return _decode_token(credentials.credentials)
+    except HTTPException:
+        return None
 
 
 # ---------------------------------------------------------------------------
