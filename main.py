@@ -2,6 +2,7 @@ import logging
 import os
 
 import jwt
+from jwt import PyJWKClient
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -44,25 +45,83 @@ _bearer = HTTPBearer(auto_error=False)
 # Auth helpers
 # ---------------------------------------------------------------------------
 
-def _decode_token(token: str) -> str:
-    """Verify a Supabase HS256 JWT and return the user UUID (sub claim).
+_SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+_JWKS_URL = f"{_SUPABASE_URL}/auth/v1/.well-known/jwks.json" if _SUPABASE_URL else None
+_JWKS_CLIENT = PyJWKClient(_JWKS_URL, cache_keys=True) if _JWKS_URL else None
+_ASYMMETRIC_ALGS = ["ES256", "RS256", "EdDSA"]
 
-    Raises HTTPException(401) on any decode failure. ``InvalidKeyError`` is a
-    sibling of ``InvalidTokenError`` (not a subclass), so it's caught
-    explicitly via the broad ``PyJWTError`` base.
+
+def _get_signing_key(token: str):
+    """Find the JWKS signing key for ``token``, busting the CDN cache on miss.
+
+    Supabase's JWKS endpoint sits behind a CDN with a 10-minute Cache-Control.
+    Right after promoting a new signing key, the cached payload omits it and
+    PyJWKClient raises PyJWKClientError. On that miss, we re-fetch the raw
+    JWKS bytes ourselves with a cachebust query param, parse them into a
+    PyJWKSet, and seat the result into the client's cache.
     """
-    secret = os.getenv("SUPABASE_JWT_SECRET", "")
-    if not secret:
-        logger.error("SUPABASE_JWT_SECRET is not configured")
-        raise HTTPException(status_code=500, detail="Auth not configured")
     try:
-        payload = jwt.decode(
-            token,
-            secret,
-            algorithms=["HS256"],
-            audience="authenticated",
-        )
+        return _JWKS_CLIENT.get_signing_key_from_jwt(token).key
+    except jwt.PyJWKClientError as miss:
+        import time, json, urllib.request
+        from jwt import PyJWKSet
+        try:
+            url = f"{_JWKS_URL}?_={int(time.time())}"
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                raw = resp.read().decode("utf-8")
+            data = json.loads(raw)
+            fresh = PyJWKSet.from_dict(data)
+            _JWKS_CLIENT.jwk_set_cache.put(fresh)
+            return _JWKS_CLIENT.get_signing_key_from_jwt(token).key
+        except Exception as e:
+            logger.warning("JWKS cachebust failed (%s); original miss: %s", e, miss)
+            raise miss
+
+
+def _decode_token(token: str) -> str:
+    """Verify a Supabase JWT and return the user UUID (sub claim).
+
+    Modern Supabase projects sign tokens with asymmetric keys (ES256/RS256)
+    published via JWKS. Legacy tokens use the HS256 shared secret. We dispatch
+    by the JWT header's ``alg`` field. Raises HTTPException(401) on any
+    verification failure.
+    """
+    try:
+        header = jwt.get_unverified_header(token)
+    except jwt.PyJWTError as e:
+        logger.warning("JWT header parse failed: %s", e)
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    alg = header.get("alg", "")
+    try:
+        if alg in _ASYMMETRIC_ALGS:
+            if _JWKS_CLIENT is None:
+                logger.error("SUPABASE_URL not configured; cannot fetch JWKS")
+                raise HTTPException(status_code=500, detail="Auth not configured")
+            signing_key = _get_signing_key(token)
+            payload = jwt.decode(
+                token,
+                signing_key,
+                algorithms=_ASYMMETRIC_ALGS,
+                audience="authenticated",
+            )
+        elif alg == "HS256":
+            secret = os.getenv("SUPABASE_JWT_SECRET", "")
+            if not secret:
+                logger.error("SUPABASE_JWT_SECRET is not configured")
+                raise HTTPException(status_code=500, detail="Auth not configured")
+            payload = jwt.decode(
+                token,
+                secret,
+                algorithms=["HS256"],
+                audience="authenticated",
+            )
+        else:
+            logger.warning("Unsupported JWT alg: %s", alg)
+            raise HTTPException(status_code=401, detail="Invalid token")
         return payload["sub"]
+    except HTTPException:
+        raise
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.PyJWTError as e:
