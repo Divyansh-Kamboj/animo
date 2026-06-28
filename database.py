@@ -36,9 +36,15 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+# Server-side client uses the service-role key so RLS doesn't block writes
+# the backend performs on behalf of an already-JWT-verified user. Falls back
+# to the publishable anon key when the service role isn't configured.
 _db: Client = create_client(
     supabase_url=os.environ.get("SUPABASE_URL", ""),
-    supabase_key=os.environ.get("SUPABASE_KEY", ""),
+    supabase_key=(
+        os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        or os.environ.get("SUPABASE_KEY", "")
+    ),
 )
 
 
@@ -385,10 +391,13 @@ def get_user_favorite_genres(user_id: str | None) -> list[str]:
             _db.table("user_profiles")
             .select("favorite_genres")
             .eq("id", user_id)
-            .single()
+            .limit(1)
             .execute()
         )
-        return response.data.get("favorite_genres") or []
+        rows = response.data or []
+        if not rows:
+            return []
+        return rows[0].get("favorite_genres") or []
     except Exception:
         logger.warning("Could not fetch profile for user %s", user_id, exc_info=True)
         return []
