@@ -5,8 +5,10 @@ Enriches a (artist, track) pair with Spotify metadata: album art URL,
 genre tags, and a Spotify track ID.
 """
 
+import copy
 import logging
 import os
+from functools import lru_cache
 
 import spotipy
 from dotenv import load_dotenv
@@ -30,6 +32,24 @@ _sp = spotipy.Spotify(
 # ---------------------------------------------------------------------------
 
 def enrich_track_data(artist_name: str, song_name: str) -> dict:
+    """Public entry point — case/whitespace-normalised cache wrapper.
+
+    Spotify search is case-insensitive so we normalise both args, which gives
+    a single cache key per logical (artist, song) pair regardless of how the
+    caller spelled it. Returns a deep copy so caller mutations don't poison
+    the cache.
+    """
+    norm_artist = (artist_name or "").strip().lower()
+    norm_song = (song_name or "").strip().lower()
+    return copy.deepcopy(_enrich_cached(norm_artist, norm_song))
+
+
+@lru_cache(maxsize=4096)
+def _enrich_cached(artist_name: str, song_name: str) -> dict:
+    return _enrich_uncached(artist_name, song_name)
+
+
+def _enrich_uncached(artist_name: str, song_name: str) -> dict:
     """
     Enrich a track with Spotify metadata.
 
