@@ -179,12 +179,15 @@ def _find_track_in_window(
     min_views: int,
     max_views: int,
     depth: int,
+    exclude_youtube_ids: set[str] | None = None,
 ) -> dict | None:
     """
     Search for songs by ``artist_name`` and return the track closest to the
     max_views frontier that falls within [min_views, max_views].
 
     Checks up to SONGS_TO_CHECK results; picks the highest niche_score.
+    Any videoId in ``exclude_youtube_ids`` is skipped so already-owned tracks
+    never resurface in a new pack.
     """
     try:
         results = _ytmusic.search(artist_name, filter="songs")
@@ -193,11 +196,14 @@ def _find_track_in_window(
         return None
 
     best: dict | None = None
+    excluded = exclude_youtube_ids or set()
 
     for song in results[:SONGS_TO_CHECK]:
         video_id = song.get("videoId")
         title    = song.get("title")
         if not video_id or not title:
+            continue
+        if video_id in excluded:
             continue
 
         view_count = _get_view_count(video_id)
@@ -230,14 +236,15 @@ def _find_track_in_window(
 # ---------------------------------------------------------------------------
 
 def _find_tracks_within_window(
-    browse_id:     str,
-    min_views:     int,
-    max_views:     int,
-    chart_names:   set[str],
-    depth:         int,
-    seen:          set[str],
-    pack:          list[dict],
-    artist_counts: dict[str, int],
+    browse_id:            str,
+    min_views:            int,
+    max_views:            int,
+    chart_names:          set[str],
+    depth:                int,
+    seen:                 set[str],
+    pack:                 list[dict],
+    artist_counts:        dict[str, int],
+    exclude_youtube_ids:  set[str] | None = None,
 ) -> None:
     """
     Recursive worker. Mutates ``pack``, ``seen``, and ``artist_counts`` in place.
@@ -285,7 +292,10 @@ def _find_tracks_within_window(
         if artist_counts.get(item_name, 0) >= MAX_PER_ARTIST:
             continue
 
-        track = _find_track_in_window(item_name, min_views, max_views, depth)
+        track = _find_track_in_window(
+            item_name, min_views, max_views, depth,
+            exclude_youtube_ids=exclude_youtube_ids,
+        )
         if track:
             track["subscriber_count"] = sub_count
             pack.append(track)
@@ -315,6 +325,7 @@ def _find_tracks_within_window(
             seen=seen,
             pack=pack,
             artist_counts=artist_counts,
+            exclude_youtube_ids=exclude_youtube_ids,
         )
 
 
@@ -323,8 +334,9 @@ def _find_tracks_within_window(
 # ---------------------------------------------------------------------------
 
 def get_niche_tracks(
-    seed_artists: list[str],
-    niche_value:  float = 0.5,
+    seed_artists:        list[str],
+    niche_value:         float = 0.5,
+    exclude_youtube_ids: set[str] | None = None,
 ) -> list[dict]:
     """
     Discover niche tracks via recursive related-artist traversal.
@@ -389,6 +401,7 @@ def get_niche_tracks(
             seen=seen,
             pack=pack,
             artist_counts=artist_counts,
+            exclude_youtube_ids=exclude_youtube_ids,
         )
 
     # Verify diversification (log only — pack may be short if graph is narrow)

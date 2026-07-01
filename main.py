@@ -246,7 +246,14 @@ def open_pack(
         logger.info("Blending %d historical genre seeds for %s", len(user_genres), user_id)
         seeds = seeds + user_genres
 
-    raw_tracks = discovery.get_niche_tracks(seeds, niche_value=survey.niche_value)
+    owned_youtube_ids = database.get_user_youtube_ids(user_id)
+    if owned_youtube_ids:
+        logger.info("Excluding %d already-owned youtube_ids from discovery", len(owned_youtube_ids))
+    raw_tracks = discovery.get_niche_tracks(
+        seeds,
+        niche_value=survey.niche_value,
+        exclude_youtube_ids=owned_youtube_ids,
+    )
     if not raw_tracks:
         raise HTTPException(
             status_code=502,

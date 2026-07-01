@@ -82,18 +82,48 @@ def save_track_to_db(track_data: dict, user_id: str | None = None) -> str | None
         "user_id":          user_id,
     }
 
+    # UPSERT on (user_id, youtube_id) — the tracks_user_youtube_key partial
+    # unique index guarantees at most one row per pair, so a re-recommendation
+    # updates the existing row rather than duplicating it. On rows without a
+    # user_id (legacy anon inserts) the index doesn't apply and we still get a
+    # plain insert.
     try:
-        response = _db.table("tracks").insert(payload).execute()
+        response = (
+            _db.table("tracks")
+            .upsert(payload, on_conflict="user_id,youtube_id")
+            .execute()
+        )
         rows = response.data
         if not rows:
-            logger.error("Track insert returned no data for payload: %s", payload)
+            logger.error("Track upsert returned no data for payload: %s", payload)
             return None
         track_id = rows[0].get("id")
-        logger.info("Saved track '%s' with id %s", payload.get("title"), track_id)
+        logger.info("Saved/updated track '%s' with id %s", payload.get("title"), track_id)
         return track_id
     except Exception:
-        logger.error("Failed to insert track '%s'", payload.get("title"), exc_info=True)
+        logger.error("Failed to upsert track '%s'", payload.get("title"), exc_info=True)
         return None
+
+
+def get_user_youtube_ids(user_id: str) -> set[str]:
+    """Return the set of youtube_ids already in this user's library.
+
+    Used by /open-pack to prime discovery's exclusion set so the recursive
+    niche walk doesn't re-surface a track the user has already been shown.
+    Falls back to an empty set on error — worst case is a repeat, not a
+    5xx.
+    """
+    try:
+        response = (
+            _db.table("tracks")
+            .select("youtube_id")
+            .eq("user_id", user_id)
+            .execute()
+        )
+        return {r["youtube_id"] for r in (response.data or []) if r.get("youtube_id")}
+    except Exception:
+        logger.warning("Could not fetch owned youtube_ids for %s", user_id, exc_info=True)
+        return set()
 
 
 def get_user_tracks(user_id: str) -> list[dict]:
